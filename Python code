@@ -1,0 +1,180 @@
+import random
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from moviepy.editor import VideoFileClip, concatenate_videoclips
+from concurrent.futures import ThreadPoolExecutor
+
+
+def extract_random_clips(video_path, clip_duration, num_clips):
+    """
+    从单个视频中随机抽取不重复片段。
+
+    :param video_path: 视频文件路径
+    :param clip_duration: 每段片段的时长（秒）
+    :param num_clips: 要抽取的片段数量
+    :return: 抽取的 VideoFileClip 对象列表
+    """
+    video = VideoFileClip(video_path)
+    video_duration = video.duration
+
+    if video_duration < clip_duration * num_clips:
+        raise ValueError(f"视频 {video_path} 时长不足以抽取 {num_clips} 个片段！")
+
+    start_times = random.sample(
+        range(0, int(video_duration - clip_duration)), num_clips
+    )
+    return [video.subclip(start, start + clip_duration) for start in start_times]
+
+
+def process_videos(input_videos, output_video, clip_duration, num_clips_per_video, enable_multithreading, enable_gpu, enable_shuffle):
+    """
+    从多个视频中随机抽取片段，并合成为一个新视频。
+
+    :param input_videos: 输入视频文件路径列表
+    :param output_video: 输出视频文件路径
+    :param clip_duration: 每段片段的时长（秒）
+    :param num_clips_per_video: 每个视频抽取的片段数量
+    :param enable_multithreading: 是否启用多线程
+    :param enable_gpu: 是否启用 GPU 加速
+    :param enable_shuffle: 是否打乱片段顺序
+    """
+    try:
+        all_clips = []
+
+        if enable_multithreading:
+            with ThreadPoolExecutor() as executor:
+                futures = [
+                    executor.submit(
+                        extract_random_clips, video, clip_duration, num_clips_per_video
+                    )
+                    for video in input_videos
+                ]
+                for future in futures:
+                    try:
+                        all_clips.extend(future.result())
+                    except Exception as e:
+                        print(f"处理视频失败: {e}")
+        else:
+            for video in input_videos:
+                all_clips.extend(extract_random_clips(video, clip_duration, num_clips_per_video))
+
+        if not all_clips:
+            raise ValueError("未成功抽取任何片段，请检查输入视频及参数配置！")
+
+        # 乱序选项
+        if enable_shuffle:
+            random.shuffle(all_clips)
+
+        # 合成片段
+        final_video = concatenate_videoclips(all_clips, method="compose")
+
+        # 保存输出视频
+        ffmpeg_params = ["-preset", "fast", "-crf", "23"]
+        if enable_gpu:
+            ffmpeg_params.extend(["-c:v", "h264_nvenc"])
+
+        final_video.write_videofile(
+            output_video,
+            codec="libx264",
+            audio_codec="aac",
+            ffmpeg_params=ffmpeg_params,
+        )
+        messagebox.showinfo("成功", f"新视频已保存到: {output_video}")
+    except Exception as e:
+        messagebox.showerror("错误", f"发生错误: {e}")
+
+
+def select_videos():
+    files = filedialog.askopenfilenames(
+        title="选择视频文件",
+        filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv")]
+    )
+    input_videos_list.delete(0, tk.END)
+    for file in files:
+        input_videos_list.insert(tk.END, file)
+
+
+def select_output_file():
+    output_file = filedialog.asksaveasfilename(
+        title="选择输出文件",
+        defaultextension=".mp4",
+        filetypes=[("MP4 文件", "*.mp4")]
+    )
+    output_video_entry.delete(0, tk.END)
+    output_video_entry.insert(0, output_file)
+
+
+def start_processing():
+    input_videos = input_videos_list.get(0, tk.END)
+    output_video = output_video_entry.get()
+
+    try:
+        clip_duration = int(clip_duration_entry.get())
+        num_clips_per_video = int(num_clips_entry.get())
+    except ValueError:
+        messagebox.showerror("错误", "片段时长和片段数量必须是整数！")
+        return
+
+    if not input_videos:
+        messagebox.showerror("错误", "请至少选择一个视频文件！")
+        return
+
+    if not output_video:
+        messagebox.showerror("错误", "请指定输出文件路径！")
+        return
+
+    process_videos(
+        input_videos,
+        output_video,
+        clip_duration,
+        num_clips_per_video,
+        enable_multithreading_var.get(),
+        enable_gpu_var.get(),
+        enable_shuffle_var.get()
+    )
+
+
+# 创建主窗口
+root = tk.Tk()
+root.title("视频片段随机合成工具（多线程 & GPU 加速 & 乱序）")
+
+# 输入视频选择
+tk.Label(root, text="输入视频文件:").grid(row=0, column=0, sticky="w")
+tk.Button(root, text="选择视频文件", command=select_videos).grid(row=0, column=1, sticky="e")
+
+input_videos_list = tk.Listbox(root, height=6, width=50, selectmode=tk.MULTIPLE)
+input_videos_list.grid(row=1, column=0, columnspan=2, padx=10, pady=5)
+
+# 输出文件选择
+tk.Label(root, text="输出文件路径:").grid(row=2, column=0, sticky="w")
+output_video_entry = tk.Entry(root, width=40)
+output_video_entry.grid(row=3, column=0, padx=10, pady=5)
+tk.Button(root, text="选择输出路径", command=select_output_file).grid(row=3, column=1, sticky="e")
+
+# 参数设置
+tk.Label(root, text="每段片段时长 (秒):").grid(row=4, column=0, sticky="w")
+clip_duration_entry = tk.Entry(root, width=10)
+clip_duration_entry.grid(row=4, column=1, sticky="e")
+clip_duration_entry.insert(0, "5")
+
+tk.Label(root, text="每视频片段数量:").grid(row=5, column=0, sticky="w")
+num_clips_entry = tk.Entry(root, width=10)
+num_clips_entry.grid(row=5, column=1, sticky="e")
+num_clips_entry.insert(0, "2")
+
+# 多线程开关
+enable_multithreading_var = tk.BooleanVar(value=True)
+tk.Checkbutton(root, text="启用多线程", variable=enable_multithreading_var).grid(row=6, column=0, sticky="w")
+
+# GPU 加速开关
+enable_gpu_var = tk.BooleanVar(value=True)
+tk.Checkbutton(root, text="启用 GPU 加速", variable=enable_gpu_var).grid(row=6, column=1, sticky="e")
+
+# 乱序开关
+enable_shuffle_var = tk.BooleanVar(value=True)
+tk.Checkbutton(root, text="乱序片段", variable=enable_shuffle_var).grid(row=7, column=0, sticky="w")
+
+# 开始处理按钮
+tk.Button(root, text="开始生成", command=start_processing).grid(row=8, column=0, columnspan=2, pady=10)
+
+root.mainloop()
