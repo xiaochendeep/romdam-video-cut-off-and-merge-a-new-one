@@ -1,180 +1,527 @@
+
+# video_sampler_gui.py
+# Python 3.13, requires PyQt6 and ffmpeg installed on PATH
+#
+# 功能：从多个视频中随机抽取若干段并合成一个新视频（多线程 + 可选 GPU 编码）
+#
+# 注意：需要系统安装 ffmpeg，并且若要使用 GPU 加速需安装相应的显卡驱动与 ffmpeg 支持的 encoder（如 h264_nvenc）
+
+import os
+import sys
 import random
-import tkinter as tk
-from tkinter import filedialog, messagebox
-from moviepy.editor import VideoFileClip, concatenate_videoclips
-from concurrent.futures import ThreadPoolExecutor
+import tempfile
+import subprocess
+import math
+import shutil
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Tuple
 
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QFileDialog,
+    QLabel, QSpinBox, QCheckBox, QProgressBar, QTextEdit, QMessageBox, QLineEdit
+)
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QThread
 
-def extract_random_clips(video_path, clip_duration, num_clips):
-    """
-    从单个视频中随机抽取不重复片段。
+# --------- 配置 dataclass ----------
+@dataclass
+class SegmentRequest:
+    src_path: str
+    start: float
+    duration: float
+    out_path: str
 
-    :param video_path: 视频文件路径
-    :param clip_duration: 每段片段的时长（秒）
-    :param num_clips: 要抽取的片段数量
-    :return: 抽取的 VideoFileClip 对象列表
-    """
-    video = VideoFileClip(video_path)
-    video_duration = video.duration
+# --------- 工具函数 ----------
+def locate_ffmpeg() -> str:
+    exe = shutil.which("ffmpeg")
+    if exe is None:
+        return ""
+    return exe
 
-    if video_duration < clip_duration * num_clips:
-        raise ValueError(f"视频 {video_path} 时长不足以抽取 {num_clips} 个片段！")
-
-    start_times = random.sample(
-        range(0, int(video_duration - clip_duration)), num_clips
-    )
-    return [video.subclip(start, start + clip_duration) for start in start_times]
-
-
-def process_videos(input_videos, output_video, clip_duration, num_clips_per_video, enable_multithreading, enable_gpu, enable_shuffle):
-    """
-    从多个视频中随机抽取片段，并合成为一个新视频。
-
-    :param input_videos: 输入视频文件路径列表
-    :param output_video: 输出视频文件路径
-    :param clip_duration: 每段片段的时长（秒）
-    :param num_clips_per_video: 每个视频抽取的片段数量
-    :param enable_multithreading: 是否启用多线程
-    :param enable_gpu: 是否启用 GPU 加速
-    :param enable_shuffle: 是否打乱片段顺序
-    """
+def get_video_duration(ffmpeg: str, path: str) -> float:
+    # 使用 ffprobe（ffmpeg 的一部分）查询时长
     try:
-        all_clips = []
-
-        if enable_multithreading:
-            with ThreadPoolExecutor() as executor:
-                futures = [
-                    executor.submit(
-                        extract_random_clips, video, clip_duration, num_clips_per_video
-                    )
-                    for video in input_videos
-                ]
-                for future in futures:
-                    try:
-                        all_clips.extend(future.result())
-                    except Exception as e:
-                        print(f"处理视频失败: {e}")
+        ffprobe = shutil.which("ffprobe") or ffmpeg  # if ffprobe missing, call ffmpeg -i parse (less ideal)
+        if shutil.which("ffprobe"):
+            cmd = [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                   "-of", "default=noprint_wrappers=1:nokey=1", path]
+            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode().strip()
+            return float(out)
         else:
-            for video in input_videos:
-                all_clips.extend(extract_random_clips(video, clip_duration, num_clips_per_video))
+            # 备选：用 ffmpeg -i 并解析 stderr
+            cmd = [ffmpeg, "-i", path]
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+            _, err = p.communicate(timeout=10)
+            # 解析 Duration: 00:10:05.32
+            for line in err.splitlines():
+                if "Duration" in line:
+                    part = line.split("Duration:")[1].split(",")[0].strip()
+                    h, m, s = part.split(":")
+                    return int(h) * 3600 + int(m) * 60 + float(s)
+    except Exception:
+        pass
+    return 0.0
 
-        if not all_clips:
-            raise ValueError("未成功抽取任何片段，请检查输入视频及参数配置！")
+def run_ffmpeg_extract(ffmpeg_bin: str, req: SegmentRequest, reencode: bool, gpu: bool, progress_callback=None) -> Tuple[bool, str]:
+    """
+    提取一段视频并保存到 req.out_path。
+    修改：
+    1. 增加了 -err_detect ignore_err 参数，防止因音频微小损坏导致 FFmpeg 停止。
+    2. 增加了对 None 返回值的处理，防止 Python 崩溃。
+    """
+    out_dir = os.path.dirname(req.out_path)
+    os.makedirs(out_dir, exist_ok=True)
+    start = req.start
+    dur = req.duration
 
-        # 乱序选项
-        if enable_shuffle:
-            random.shuffle(all_clips)
+    # 构建基础命令
+    # -err_detect ignore_err: 忽略解码错误
+    # -ignore_unknown: 忽略未知的流类型
+    base_input_args = [ffmpeg_bin, "-y", "-err_detect", "ignore_err", "-ignore_unknown"]
 
-        # 合成片段
-        final_video = concatenate_videoclips(all_clips, method="compose")
-
-        # 保存输出视频
-        ffmpeg_params = ["-preset", "fast", "-crf", "23"]
-        if enable_gpu:
-            ffmpeg_params.extend(["-c:v", "h264_nvenc"])
-
-        final_video.write_videofile(
-            output_video,
-            codec="libx264",
-            audio_codec="aac",
-            ffmpeg_params=ffmpeg_params,
-        )
-        messagebox.showinfo("成功", f"新视频已保存到: {output_video}")
-    except Exception as e:
-        messagebox.showerror("错误", f"发生错误: {e}")
-
-
-def select_videos():
-    files = filedialog.askopenfilenames(
-        title="选择视频文件",
-        filetypes=[("视频文件", "*.mp4 *.avi *.mov *.mkv")]
-    )
-    input_videos_list.delete(0, tk.END)
-    for file in files:
-        input_videos_list.insert(tk.END, file)
-
-
-def select_output_file():
-    output_file = filedialog.asksaveasfilename(
-        title="选择输出文件",
-        defaultextension=".mp4",
-        filetypes=[("MP4 文件", "*.mp4")]
-    )
-    output_video_entry.delete(0, tk.END)
-    output_video_entry.insert(0, output_file)
-
-
-def start_processing():
-    input_videos = input_videos_list.get(0, tk.END)
-    output_video = output_video_entry.get()
-
+    if reencode:
+        # 根据 gpu 参数选择编码器
+        vcodec = "h264_nvenc" if gpu else "libx264"
+        acodec = "aac"
+        # 标准化：1080p, 30fps, aac 44.1k, stereo, yuv420p
+        # 使用 scale+pad 保证分辨率一致且不拉伸
+        filters = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"
+        
+        cmd = base_input_args + [
+            "-ss", f"{start:.3f}",
+            "-i", req.src_path,
+            "-t", f"{dur:.3f}",
+            "-vf", filters,
+            "-r", "30",
+            "-c:v", vcodec,
+            "-preset", "p7" if gpu else "fast",
+            "-c:a", acodec,
+            "-ar", "44100",
+            "-ac", "2",
+            "-pix_fmt", "yuv420p",
+            req.out_path
+        ]
+    else:
+        cmd = base_input_args + [
+            "-ss", f"{start:.3f}",
+            "-i", req.src_path,
+            "-t", f"{dur:.3f}",
+            "-c", "copy",
+            req.out_path
+        ]
+    
     try:
-        clip_duration = int(clip_duration_entry.get())
-        num_clips_per_video = int(num_clips_entry.get())
-    except ValueError:
-        messagebox.showerror("错误", "片段时长和片段数量必须是整数！")
-        return
+        # 执行命令
+        # 执行命令
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        out, err = p.communicate()
+        
+        # --- 安全处理 None 值 ---
+        out = out if out is not None else ""
+        err = err if err is not None else ""
+        # ----------------------
 
-    if not input_videos:
-        messagebox.showerror("错误", "请至少选择一个视频文件！")
-        return
+        if progress_callback:
+            progress_callback(err + out)
+        
+        ok = p.returncode == 0
+        return ok, (out + "\n" + err)
+    except Exception as e:
+        return False, str(e)
 
-    if not output_video:
-        messagebox.showerror("错误", "请指定输出文件路径！")
-        return
+def concat_segments(ffmpeg_bin: str, segment_files: List[str], out_file: str, reencode: bool, gpu: bool, progress_callback=None) -> Tuple[bool, str]:
+    """
+    合并 segments 列表为一个文件（out_file）。
+    如果 segments 已经编码相同且容器可 concat，则使用 concat demuxer，否则重新编码。
+    这里采用通用做法：用 concat demuxer 若 reencode==False，则尝试 copy；否则使用 ffmpeg 进行逐个输入并编码输出。
+    """
+    os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix="concat_")
+    list_txt = os.path.join(tmp_dir, "list.txt")
+    with open(list_txt, "w", encoding="utf-8") as f:
+        for s in segment_files:
+            # note: paths with special chars need escaping; 使用绝对路径
+            f.write(f"file '{os.path.abspath(s)}'\n")
 
-    process_videos(
-        input_videos,
-        output_video,
-        clip_duration,
-        num_clips_per_video,
-        enable_multithreading_var.get(),
-        enable_gpu_var.get(),
-        enable_shuffle_var.get()
-    )
+    if not reencode:
+        # 尝试直接 concat copy（要求 codec/container 相同）
+        cmd = [ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", list_txt, "-c", "copy", out_file]
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+            out, err = p.communicate()
+            if progress_callback:
+                progress_callback(err + out)
+            if p.returncode == 0:
+                return True, out + "\n" + err
+            # 若失败则 fallback 到 reencode
+        except Exception as e:
+            if progress_callback:
+                progress_callback(str(e))
+
+    # 走 re-encode 路线：输入多文件、输出单文件并编码
+    vcodec = "h264_nvenc" if gpu else "libx264"
+    acodec = "aac"
+    # prepare input arguments: use concat demuxer still but ask ffmpeg to re-encode
+    cmd = [ffmpeg_bin, "-y", "-f", "concat", "-safe", "0", "-i", list_txt, "-c:v", vcodec, "-preset", "p7" if gpu else "medium", "-c:a", acodec, out_file]
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        out, err = p.communicate()
+        if progress_callback:
+            progress_callback(err + out)
+        ok = p.returncode == 0
+        return ok, out + "\n" + err
+    except Exception as e:
+        return False, str(e)
+
+# --------- 后台工作线程 ----------
+class WorkerSignals(QObject):
+    progress = pyqtSignal(int)           # overall percentage
+    log = pyqtSignal(str)               # log text lines
+    finished = pyqtSignal(bool, str)    # success, output_path or message
+
+class Worker(QThread):
+    def __init__(self, files: List[str], count_min: int, count_max: int, segment_min: int, segment_max: int,
+                 seed: int, shuffle_segments: bool, random_time: bool, gpu: bool, ffmpeg_bin: str, output_path: str):
+        super().__init__()
+        self.files = files
+        self.count_min = count_min
+        self.count_max = count_max
+        self.segment_min = segment_min
+        self.segment_max = segment_max
+        self.seed = seed
+        self.shuffle_segments = shuffle_segments
+        self.random_time = random_time
+        self.gpu = gpu
+        self.ffmpeg = ffmpeg_bin
+        self.output_path = output_path
+        self.signals = WorkerSignals()
+
+    def log(self, text: str):
+        self.signals.log.emit(text)
+
+    def run(self):
+        try:
+            random.seed(self.seed if self.seed is not None else None)
+            self.log(f"开始处理 {len(self.files)} 个视频...")
+
+            # 1. 收集每个视频的有效时长（从第5分钟开始）
+            dur_list = []
+            for f in self.files:
+                d = get_video_duration(self.ffmpeg, f)
+                if d <= 0:
+                    self.log(f"无法获取视频时长：{f}（跳过）")
+                    dur_list.append(0.0)
+                else:
+                    dur_list.append(d)
+                    self.log(f"视频：{f} 时长 {d:.1f}s")
+
+            # 2. 计算要抽取的片段（确保每段从 >= 5*60 开始，并在该视频范围内）
+            seg_requests: List[SegmentRequest] = []
+            segment_files = []
+            total_segments_expected = 0
+            min_start_offset = 5 * 60  # 5 分钟
+            for idx, f in enumerate(self.files):
+                duration = dur_list[idx]
+                if duration <= min_start_offset + 1.0:
+                    self.log(f"视频 {f} 太短，无法从第5分钟之后抽取（跳过）")
+                    continue
+                # 每个视频抽取 count_min ~ count_max 段
+                N = random.randint(self.count_min, self.count_max)
+                total_segments_expected += N
+                
+                chosen = []
+                
+                if not self.random_time:
+                    # 顺序抽取：从 min_start_offset 开始，每段间隔 0
+                    current_start = min_start_offset
+                    for _ in range(N):
+                        seg_len = (self.segment_min + self.segment_max) / 2.0
+                        if current_start + seg_len > duration:
+                            break
+                        chosen.append((current_start, seg_len))
+                        current_start += seg_len
+                else:
+                    # 随机抽取
+                    # 为避免重叠，我们先生成一个可用区间 [min_start_offset, duration - segment_max]
+                    # We'll attempt to sample non-overlapping starts greedily
+                    available_intervals = [(min_start_offset, duration - 0.0001)]
+                    attempts = 0
+                    while len(chosen) < N and attempts < N * 50:
+                        attempts += 1
+                        seg_len = random.uniform(self.segment_min, self.segment_max)
+                        # choose an interval at random from available_intervals
+                        if not available_intervals:
+                            break
+                        iv = random.choice(available_intervals)
+                        a, b = iv
+                        if b - a < seg_len + 0.5:
+                            # can't fit here
+                            continue
+                        start = random.uniform(a, b - seg_len)
+                        # ensure start + seg_len <= duration
+                        if start + seg_len > duration:
+                            continue
+                        # register chosen and update available_intervals to remove overlap
+                        chosen.append((start, seg_len))
+                        # update available intervals (split)
+                        new_intervals = []
+                        for (ia, ib) in available_intervals:
+                            if start >= ib or start + seg_len <= ia:
+                                new_intervals.append((ia, ib))
+                            else:
+                                # left
+                                if ia < start:
+                                    new_intervals.append((ia, start))
+                                # right
+                                if start + seg_len < ib:
+                                    new_intervals.append((start + seg_len, ib))
+                        available_intervals = new_intervals
+
+                if len(chosen) < N:
+                    self.log(f"警告：视频 {f} 只能选到 {len(chosen)}/{N} 段。")
+
+                # 为每个 chosen 生成输出文件路径
+                for i, (st, ln) in enumerate(chosen):
+                    base = Path(f).stem
+                    outname = f"{base}_seg_{i}_{int(st)}_{int(ln*1000)}.mp4"
+                    outpath = os.path.join(tempfile.gettempdir(), "video_sampler_out", outname)
+                    seg_requests.append(SegmentRequest(src_path=f, start=st, duration=ln, out_path=outpath))
+                    segment_files.append(outpath)
+
+            if len(seg_requests) == 0:
+                self.signals.finished.emit(False, "未生成任何待处理片段（输入视频可能过短或无效）")
+                return
+
+            # 3. 如果需要全局乱序则 shuffle segment_requests 的顺序
+            if self.shuffle_segments:
+                random.shuffle(seg_requests)
+                self.log("已开启全局乱序：将打乱所有片段的顺序。")
+
+            # 4. 并行提取片段（使用线程池）
+            total = len(seg_requests)
+            done = 0
+            self.log(f"准备并行提取 {total} 段片段（多线程）...")
+            # We'll spawn simple threads via QThread for each sequentially to avoid too many ffmpeg at once.
+            # Limit concurrent ffmpeg processes to cpu_count or 4
+            max_workers = min(4, max(1, os.cpu_count() or 1))
+            import concurrent.futures
+            def extract_one(req: SegmentRequest):
+                ok, out = run_ffmpeg_extract(self.ffmpeg, req, reencode=True, gpu=self.gpu, progress_callback=self.log)
+                return ok, req.out_path, out
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = [ex.submit(extract_one, r) for r in seg_requests]
+                for fut in concurrent.futures.as_completed(futures):
+                    ok, out_path, logtxt = fut.result()
+                    done += 1
+                    perc = int(done / total * 80)  # 给提取部分 0-80% 权重
+                    self.signals.progress.emit(perc)
+                    if ok:
+                        self.log(f"已完成段：{out_path}")
+                    else:
+                        self.log(f"段提取失败：{out_path}，日志：{logtxt}")
+
+            # 5. 合成
+            self.log("开始合成所有片段为目标视频...")
+            # 先收集实际存在的 segment files（按 seg_requests 的顺序）
+            existing_segments = [r.out_path for r in seg_requests if os.path.exists(r.out_path)]
+            if len(existing_segments) == 0:
+                self.signals.finished.emit(False, "没有可用的片段进行合成（提取全部失败）。")
+                return
+
+            # 合成阶段权重 80-100%
+            ok, outmsg = concat_segments(self.ffmpeg, existing_segments, self.output_path, reencode=True, gpu=self.gpu, progress_callback=self.log)
+            if ok:
+                self.signals.progress.emit(100)
+                self.signals.finished.emit(True, self.output_path)
+            else:
+                self.signals.finished.emit(False, outmsg)
+        except Exception as e:
+            self.signals.finished.emit(False, str(e))
 
 
-# 创建主窗口
-root = tk.Tk()
-root.title("视频片段随机合成工具（多线程 & GPU 加速 & 乱序）")
+# --------- GUI ----------
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("视频随机抽取并合成 - Python GUI")
+        self.resize(800, 520)
 
-# 输入视频选择
-tk.Label(root, text="输入视频文件:").grid(row=0, column=0, sticky="w")
-tk.Button(root, text="选择视频文件", command=select_videos).grid(row=0, column=1, sticky="e")
+        # Widgets
+        self.btn_select = QPushButton("选择视频文件...")
+        self.lbl_files = QLabel("未选择文件")
+        
+        self.spin_count_min = QSpinBox()
+        self.spin_count_min.setRange(1, 20)
+        self.spin_count_min.setValue(3)
+        self.spin_count_max = QSpinBox()
+        self.spin_count_max.setRange(1, 20)
+        self.spin_count_max.setValue(4)
 
-input_videos_list = tk.Listbox(root, height=6, width=50, selectmode=tk.MULTIPLE)
-input_videos_list.grid(row=1, column=0, columnspan=2, padx=10, pady=5)
+        self.spin_segmin = QSpinBox()
+        self.spin_segmin.setRange(1, 30)
+        self.spin_segmin.setValue(3)
+        self.spin_segmax = QSpinBox()
+        self.spin_segmax.setRange(1, 30)
+        self.spin_segmax.setValue(4)
+        
+        self.chk_random_time = QCheckBox("随机抽取时间段")
+        self.chk_random_time.setChecked(True)
+        self.chk_shuffle = QCheckBox("乱序合并（打乱所有片段）")
+        self.chk_gpu = QCheckBox("启用 GPU 加速（若可用）")
+        self.btn_start = QPushButton("开始")
+        self.progress = QProgressBar()
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.lbl_ffmpeg = QLabel("FFmpeg: 未检测")
+        self.btn_choose_output = QPushButton("选择输出文件...")
+        self.output_path_edit = QLineEdit(os.path.join(os.path.expanduser("~"), "video_sampler_output.mp4"))
 
-# 输出文件选择
-tk.Label(root, text="输出文件路径:").grid(row=2, column=0, sticky="w")
-output_video_entry = tk.Entry(root, width=40)
-output_video_entry.grid(row=3, column=0, padx=10, pady=5)
-tk.Button(root, text="选择输出路径", command=select_output_file).grid(row=3, column=1, sticky="e")
+        # Layout
+        top_layout = QHBoxLayout()
+        top_layout.addWidget(self.btn_select)
+        top_layout.addWidget(self.lbl_files)
 
-# 参数设置
-tk.Label(root, text="每段片段时长 (秒):").grid(row=4, column=0, sticky="w")
-clip_duration_entry = tk.Entry(root, width=10)
-clip_duration_entry.grid(row=4, column=1, sticky="e")
-clip_duration_entry.insert(0, "5")
+        settings_layout = QHBoxLayout()
+        settings_layout.addWidget(QLabel("每视频段数:"))
+        settings_layout.addWidget(self.spin_count_min)
+        settings_layout.addWidget(QLabel("-"))
+        settings_layout.addWidget(self.spin_count_max)
+        
+        settings_layout.addWidget(QLabel("每段秒数:"))
+        settings_layout.addWidget(self.spin_segmin)
+        settings_layout.addWidget(QLabel("-"))
+        settings_layout.addWidget(self.spin_segmax)
+        
+        settings_layout.addStretch()
+        settings_layout.addWidget(self.chk_random_time)
+        settings_layout.addWidget(self.chk_shuffle)
+        settings_layout.addWidget(self.chk_gpu)
 
-tk.Label(root, text="每视频片段数量:").grid(row=5, column=0, sticky="w")
-num_clips_entry = tk.Entry(root, width=10)
-num_clips_entry.grid(row=5, column=1, sticky="e")
-num_clips_entry.insert(0, "2")
+        out_layout = QHBoxLayout()
+        out_layout.addWidget(QLabel("输出:"))
+        out_layout.addWidget(self.output_path_edit)
+        out_layout.addWidget(self.btn_choose_output)
 
-# 多线程开关
-enable_multithreading_var = tk.BooleanVar(value=True)
-tk.Checkbutton(root, text="启用多线程", variable=enable_multithreading_var).grid(row=6, column=0, sticky="w")
+        main_layout = QVBoxLayout()
+        main_layout.addLayout(top_layout)
+        main_layout.addLayout(settings_layout)
+        main_layout.addLayout(out_layout)
+        main_layout.addWidget(self.lbl_ffmpeg)
+        main_layout.addWidget(self.btn_start)
+        main_layout.addWidget(self.progress)
+        main_layout.addWidget(QLabel("日志:"))
+        main_layout.addWidget(self.log)
 
-# GPU 加速开关
-enable_gpu_var = tk.BooleanVar(value=True)
-tk.Checkbutton(root, text="启用 GPU 加速", variable=enable_gpu_var).grid(row=6, column=1, sticky="e")
+        self.setLayout(main_layout)
 
-# 乱序开关
-enable_shuffle_var = tk.BooleanVar(value=True)
-tk.Checkbutton(root, text="乱序片段", variable=enable_shuffle_var).grid(row=7, column=0, sticky="w")
+        # State
+        self.files = []
+        self.ffmpeg = locate_ffmpeg()
+        self.update_ffmpeg_label()
 
-# 开始处理按钮
-tk.Button(root, text="开始生成", command=start_processing).grid(row=8, column=0, columnspan=2, pady=10)
+        # Signals
+        self.btn_select.clicked.connect(self.select_files)
+        self.btn_choose_output.clicked.connect(self.choose_output)
+        self.btn_start.clicked.connect(self.start_processing)
 
-root.mainloop()
+    def update_ffmpeg_label(self):
+        if self.ffmpeg:
+            self.lbl_ffmpeg.setText(f"FFmpeg: {self.ffmpeg}")
+        else:
+            self.lbl_ffmpeg.setText("FFmpeg 未找到！请安装 ffmpeg 并将其加入 PATH。")
+
+    def select_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "选择视频文件", os.path.expanduser("~"),
+                                                "Video Files (*.mp4 *.mov *.mkv *.ts *.avi);;All Files (*)")
+        if files:
+            self.files = files
+            self.lbl_files.setText(f"已选择 {len(files)} 个文件")
+            self.log.append(f"选择文件：\n" + "\n".join(files))
+
+    def choose_output(self):
+        path, _ = QFileDialog.getSaveFileName(self, "选择输出文件", self.output_path_edit.text(),
+                                              "MP4 文件 (*.mp4);;All Files (*)")
+        if path:
+            if not path.lower().endswith(".mp4"):
+                path += ".mp4"
+            self.output_path_edit.setText(path)
+
+    def append_log(self, text: str):
+        self.log.append(text)
+        # auto scroll
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+    def start_processing(self):
+        if not self.files:
+            QMessageBox.warning(self, "错误", "请先选择至少一个视频文件。")
+            return
+        if not self.ffmpeg:
+            QMessageBox.critical(self, "错误", "未找到 ffmpeg，请先安装 ffmpeg 并确保可在命令行运行。")
+            return
+        seg_min = int(self.spin_segmin.value())
+        seg_max = int(self.spin_segmax.value())
+        if seg_min > seg_max:
+            QMessageBox.warning(self, "参数错误", "每段秒数的最小值不能大于最大值。")
+            return
+        count_min = int(self.spin_count_min.value())
+        count_max = int(self.spin_count_max.value())
+        if count_min > count_max:
+             QMessageBox.warning(self, "参数错误", "段数最小值不能大于最大值。")
+             return
+
+        seed = random.randint(0, 2**31-1)
+        shuffle = bool(self.chk_shuffle.isChecked())
+        random_time = bool(self.chk_random_time.isChecked())
+        gpu = bool(self.chk_gpu.isChecked())
+        output_path = self.output_path_edit.text().strip()
+        if not output_path:
+            QMessageBox.warning(self, "错误", "请选择输出文件路径。")
+            return
+
+        # Disable UI
+        self.btn_start.setEnabled(False)
+        self.btn_select.setEnabled(False)
+        self.append_log("开始任务...")
+
+        # prepare worker
+        self.worker = Worker(files=self.files,
+                             count_min=count_min,
+                             count_max=count_max,
+                             segment_min=seg_min,
+                             segment_max=seg_max,
+                             seed=seed,
+                             shuffle_segments=shuffle,
+                             random_time=random_time,
+                             gpu=gpu,
+                             ffmpeg_bin=self.ffmpeg,
+                             output_path=output_path)
+        self.worker.signals.progress.connect(self.on_progress)
+        self.worker.signals.log.connect(self.append_log)
+        self.worker.signals.finished.connect(self.on_finished)
+        self.progress.setValue(0)
+        self.worker.start()
+
+    def on_progress(self, val: int):
+        self.progress.setValue(val)
+
+    def on_finished(self, success: bool, msg: str):
+        self.btn_start.setEnabled(True)
+        self.btn_select.setEnabled(True)
+        if success:
+            self.progress.setValue(100)
+            self.append_log(f"任务完成，输出文件：{msg}")
+            QMessageBox.information(self, "完成", f"合成完成：\n{msg}")
+        else:
+            self.append_log(f"任务失败：{msg}")
+            QMessageBox.critical(self, "失败", f"处理失败：\n{msg}")
+
+# --------- main ----------
+def main():
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
