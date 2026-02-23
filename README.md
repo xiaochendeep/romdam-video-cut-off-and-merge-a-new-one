@@ -27,3 +27,41 @@ Toggle Randomize Segment Selection as desired.
 Toggle Shuffle Output Segments as desired.
 Check Enable GPU Acceleration if you have an NVIDIA GPU.
 Click Start.
+
+
+Go version
+
+Video Processor Refactor (Go + Wails + Vue)
+I have successfully refactored the Python 
+video_processor.py
+ script into a modern desktop application using Go, Wails v2, and Vue 3.
+
+Key Highlights
+Modern UI: A sleek, dark-themed interface built with Vue 3, featuring a real-time log monitor and progress tracking.
+Improved Performance: Leverages Go's goroutines for concurrent video segment extraction (defaulting to 4 concurrent workers).
+Core Features Retained:
+Random segment extraction from multiple videos.
+Custom segment counts and durations.
+Start offset support (skipping the beginning of videos).
+GPU acceleration support (NVENC).
+Global segment shuffling.
+Implementation Details
+Backend (Go):
+ffmpeg.go
+: Robust wrapper for 
+ffmpeg
+ and ffprobe.
+processor.go
+: Orchestrates the processing logic with concurrency management.
+app.go
+: Wails bindings for native file dialogs and frontend communication.
+Frontend (Vue):
+App.vue
+: Interactive dashboard for setting parameters and monitoring execution.
+Verification Result
+Compilation: The project compiles successfully for Windows (video-processor-vue.exe).
+Bindings: Wails JS bindings have been generated and integrated into the Vue frontend.
+Dependencies: Go modules and NPM packages are all resolved.
+NOTE
+
+To run the application in development mode with hot-reload, you can use: wails dev
